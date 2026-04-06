@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 
 	machineconfigclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
 	exutil "github.com/openshift/origin/test/extended/util"
+	"github.com/openshift/origin/test/extended/util/compat_otp"
 )
 
 // getNodesByLabel returns nodes matching the specified label selector
@@ -670,4 +672,85 @@ func ensureDropInDirectoryExists(ctx context.Context, oc *exutil.CLI, dirPath st
 	}
 
 	return nil
+}
+
+// ============================================================================
+// Helper functions for testcases migrated from openshift-tests-private
+// ============================================================================
+
+// PodInitConDescription describes a pod with init container for testing
+type PodInitConDescription struct {
+	Name      string
+	Namespace string
+	Template  string
+}
+
+func (p *PodInitConDescription) Create(oc *exutil.CLI) {
+	configFile := compat_otp.ProcessTemplate(oc, "--ignore-unknown-parameters=true", "-f", p.Template, "-p", "NAME="+p.Name, "NAMESPACE="+p.Namespace)
+	err := oc.AsAdmin().Run("create").Args("-f", configFile).Execute()
+	o.Expect(err).NotTo(o.HaveOccurred())
+}
+
+func (p *PodInitConDescription) Delete(oc *exutil.CLI) {
+	err := oc.AsAdmin().Run("delete").Args("-n", p.Namespace, "pod", p.Name).Execute()
+	o.Expect(err).NotTo(o.HaveOccurred())
+}
+
+func (p *PodInitConDescription) ContainerExit(oc *exutil.CLI) error {
+	return wait.Poll(2*time.Second, 2*time.Minute, func() (bool, error) {
+		initConStatus, err := oc.AsAdmin().Run("get").Args("pod", "-o=jsonpath={.items[0].status.initContainerStatuses[0].state.terminated.reason}", "-n", p.Namespace).Output()
+		framework.Logf("The initContainer status is %v", initConStatus)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		if strings.Contains(initConStatus, "Completed") {
+			framework.Logf("The initContainer exit normally")
+			return true, nil
+		}
+		framework.Logf("The initContainer not exit!")
+		return false, nil
+	})
+}
+
+func (p *PodInitConDescription) DeleteInitContainer(oc *exutil.CLI) (string, error) {
+	nodename, err := oc.AsAdmin().Run("get").Args("pod", "-o=jsonpath={.items[0].spec.nodeName}", "-n", p.Namespace).Output()
+	o.Expect(err).NotTo(o.HaveOccurred())
+	containerID, err := oc.AsAdmin().Run("get").Args("pod", "-o=jsonpath={.items[0].status.initContainerStatuses[0].containerID}", "-n", p.Namespace).Output()
+	o.Expect(err).NotTo(o.HaveOccurred())
+	framework.Logf("The containerID is %v", containerID)
+	initContainerID := string(containerID)[8:]
+	framework.Logf("The initContainerID is %s", initContainerID)
+	return compat_otp.DebugNodeWithChroot(oc, fmt.Sprintf("%s", nodename), "crictl", "rm", initContainerID)
+}
+
+func (p *PodInitConDescription) InitContainerNotRestart(oc *exutil.CLI) error {
+	return wait.Poll(3*time.Minute, 6*time.Minute, func() (bool, error) {
+		re := regexp.MustCompile("running")
+		podname, err := oc.AsAdmin().Run("get").Args("pod", "-o=jsonpath={.items[0].metadata.name}", "-n", p.Namespace).Output()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		output, err := oc.AsAdmin().Run("exec").Args(string(podname), "-n", p.Namespace, "--", "cat", "/mnt/data/test").Output()
+		framework.Logf("The /mnt/data/test: %s", output)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		found := re.FindAllString(output, -1)
+		if lenStr := len(found); lenStr > 1 {
+			framework.Logf("initContainer restart %d times.", (lenStr - 1))
+			return false, nil
+		} else if lenStr == 1 {
+			framework.Logf("initContainer not restart")
+			return true, nil
+		}
+		return false, nil
+	})
+}
+
+// PodStatus checks if pod is in Ready state
+func PodStatus(oc *exutil.CLI, namespace string, podName string) error {
+	framework.Logf("check if pod is available")
+	return wait.Poll(5*time.Second, 3*time.Minute, func() (bool, error) {
+		status, err := oc.AsAdmin().Run("get").Args("pod", podName, "-o=jsonpath={.status.conditions[?(@.type=='Ready')].status}", "-n", namespace).Output()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		if strings.Contains(status, "True") {
+			framework.Logf("Pod is running and container is Ready!")
+			return true, nil
+		}
+		return false, nil
+	})
 }

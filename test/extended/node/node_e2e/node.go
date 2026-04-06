@@ -6,10 +6,12 @@ import (
 
 	g "github.com/onsi/ginkgo/v2"
 	o "github.com/onsi/gomega"
-	nodeutils "github.com/openshift/origin/test/extended/node"
-	exutil "github.com/openshift/origin/test/extended/util"
 	"k8s.io/apimachinery/pkg/util/wait"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
+
+	nodeutils "github.com/openshift/origin/test/extended/node"
+	exutil "github.com/openshift/origin/test/extended/util"
+	"github.com/openshift/origin/test/extended/util/compat_otp"
 )
 
 var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Kubelet, CRI-O, CPU manager", func() {
@@ -102,5 +104,37 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Kubelet, CRI-O, CPU manager",
 		output, err := oc.AsAdmin().WithoutNamespace().Run("patch").Args("nodes.config.openshift.io", "cluster", "-p", `{"spec": {"cgroupMode": "v1"}}`, "--type=merge").Output()
 		o.Expect(err).Should(o.HaveOccurred())
 		o.Expect(output).To(o.ContainSubstring("spec.cgroupMode: Unsupported value: \"v1\": supported values: \"v2\", \"\""))
+	})
+
+	//author: bgudi@redhat.com
+	g.It("[OTP] Init containers should not restart when the exited init container is removed from node [OCP-38271]", func() {
+		podInitCon38271 := nodeutils.PodInitConDescription{
+			Template: exutil.FixturePath("testdata", "node", "node_e2e", "pod-initContainer.yaml"),
+		}
+
+		g.By("Test for case OCP-38271")
+		oc.SetupProject()
+		podInitCon38271.Name = "initcon-pod"
+		podInitCon38271.Namespace = oc.Namespace()
+
+		g.By("Create a pod with init container")
+		podInitCon38271.Create(oc)
+		defer podInitCon38271.Delete(oc)
+
+		g.By("Check pod status")
+		err := nodeutils.PodStatus(oc, podInitCon38271.Namespace, podInitCon38271.Name)
+		compat_otp.AssertWaitPollNoErr(err, "pod is not running")
+
+		g.By("Check init container exit normally")
+		err = podInitCon38271.ContainerExit(oc)
+		compat_otp.AssertWaitPollNoErr(err, "container not exit normally")
+
+		g.By("Delete init container")
+		_, err = podInitCon38271.DeleteInitContainer(oc)
+		compat_otp.AssertWaitPollNoErr(err, "fail to delete container")
+
+		g.By("Check init container not restart again")
+		err = podInitCon38271.InitContainerNotRestart(oc)
+		compat_otp.AssertWaitPollNoErr(err, "init container restart")
 	})
 })
